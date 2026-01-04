@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from typing import Dict
 
 class StableMILLoss(nn.Module):
-    def __init__(self, 
+    def __init__(self,
                  pos_weight: torch.Tensor = None,
                  smooth_factor: float = 0.1,
                  focal_gamma: float = 2.0,
@@ -13,7 +13,7 @@ class StableMILLoss(nn.Module):
                  instance_consistency_weight: float = 0.1):
         super().__init__()
         # Main loss parameters
-        self.pos_weight = torch.tensor([3.5]) if pos_weight is None else pos_weight
+        self.pos_weight = pos_weight
         self.smooth_factor = smooth_factor
         self.focal_gamma = focal_gamma
         
@@ -23,27 +23,33 @@ class StableMILLoss(nn.Module):
         self.instance_consistency_weight = instance_consistency_weight
     
     def forward(self, outputs: Dict[str, torch.Tensor], targets: torch.Tensor) -> torch.Tensor:
-        logits = outputs['logits'].squeeze()
+        logits = outputs['logits']
         targets = targets.float()
+
+        if self.pos_weight is None:
+            # Default to balanced weight of 1 per class
+            self.pos_weight = torch.ones(logits.shape[-1], device=logits.device)
         
         # Label smoothing
-        targets = targets * (1 - self.smooth_factor) + self.smooth_factor / 2
+        num_classes = logits.shape[-1]
+        targets = targets * (1 - self.smooth_factor) + self.smooth_factor / max(num_classes, 1)
         
         # Focal loss with BCE
         pt = torch.exp(-F.binary_cross_entropy_with_logits(
             logits, targets, reduction='none'
         ))
-        bce_loss = (1 - pt)**self.focal_gamma * F.binary_cross_entropy_with_logits(
-            logits, targets,
+        bce_loss = (1 - pt) ** self.focal_gamma * F.binary_cross_entropy_with_logits(
+            logits,
+            targets,
             pos_weight=self.pos_weight,
             reduction='none'
         )
-        
+
         total_loss = bce_loss.mean()
         
         # Add temporal smoothness loss if attention weights available
         if 'attention_weights' in outputs:
-            attention_weights = outputs['attention_weights'].squeeze()
+            attention_weights = outputs['attention_weights']
             temp_loss = self._temporal_smoothness_loss(attention_weights)
             sparsity_loss = self._compute_sparsity_loss(attention_weights)
             
@@ -61,7 +67,7 @@ class StableMILLoss(nn.Module):
     def _temporal_smoothness_loss(self, attention_weights: torch.Tensor) -> torch.Tensor:
         """Penalize sudden changes in attention weights"""
         # Calculate differences between adjacent weights
-        diffs = attention_weights[:, 1:] - attention_weights[:, :-1]
+        diffs = attention_weights[:, 1:, :] - attention_weights[:, :-1, :]
         return torch.mean(diffs.pow(2))
     
     def _compute_sparsity_loss(self, attention_weights: torch.Tensor) -> torch.Tensor:

@@ -485,10 +485,11 @@ def run_pipeline(
         shuffle=True,
         collate_fn=collate_whale_bags,
     )
+    val_source_ds = val_ds if len(val_ds) > 0 else test_ds
     val_loader = None
-    if len(val_ds) > 0:
+    if val_source_ds is not None and len(val_source_ds) > 0:
         val_loader = DataLoader(
-            val_ds,
+            val_source_ds,
             batch_size=config["training"]["batch_size"],
             shuffle=False,
             collate_fn=collate_whale_bags,

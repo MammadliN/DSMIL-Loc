@@ -371,15 +371,28 @@ def train_model(
 def print_metrics(metrics):
     """Print detailed metrics"""
     logger.info("\nDetailed Metrics:")
-    logger.info(f"Accuracy: {metrics['accuracy']:.4f}")
-    logger.info(f"Precision: {metrics['precision']:.4f}")
-    logger.info(f"Recall: {metrics['recall']:.4f}")
-    logger.info(f"F1 Score: {metrics['f1']:.4f}")
-    logger.info(f"True Positives: {metrics['true_positives']}")
-    logger.info(f"False Positives: {metrics['false_positives']}")
-    logger.info(f"True Negatives: {metrics['true_negatives']}")
-    logger.info(f"False Negatives: {metrics['false_negatives']}")
-    logger.info(f"Loss: {metrics['loss']:.4f}")
+    accuracy = metrics.get('accuracy')
+    precision = metrics.get('precision')
+    recall = metrics.get('recall')
+    f1 = metrics.get('f1')
+    if accuracy is not None:
+        logger.info(f"Accuracy: {accuracy:.4f}")
+    if precision is not None:
+        logger.info(f"Precision: {precision:.4f}")
+    if recall is not None:
+        logger.info(f"Recall: {recall:.4f}")
+    if f1 is not None:
+        logger.info(f"F1 Score: {f1:.4f}")
+    if 'true_positives' in metrics:
+        logger.info(f"True Positives: {metrics['true_positives']}")
+    if 'false_positives' in metrics:
+        logger.info(f"False Positives: {metrics['false_positives']}")
+    if 'true_negatives' in metrics:
+        logger.info(f"True Negatives: {metrics['true_negatives']}")
+    if 'false_negatives' in metrics:
+        logger.info(f"False Negatives: {metrics['false_negatives']}")
+    if 'loss' in metrics:
+        logger.info(f"Loss: {metrics['loss']:.4f}")
 
 def create_cv_splits(site_years):
     """Create blocked cross-validation splits"""

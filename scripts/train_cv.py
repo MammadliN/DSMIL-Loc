@@ -41,6 +41,39 @@ def _macro_f1(predictions: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     return f1_per_class.mean()
 
 
+def _serialize_history(history: dict) -> dict:
+    """Convert training history into JSON-serializable primitives.
+
+    Ensures numpy scalars and tensors are cast to floats and recreates lists
+    to avoid accidental object sharing that can trigger circular reference
+    detection during ``json.dump``.
+    """
+
+    def _to_float(value):
+        if isinstance(value, (float, int)):
+            return float(value)
+        if isinstance(value, np.generic):
+            return float(value)
+        if isinstance(value, torch.Tensor):
+            return float(value.detach().cpu().item())
+        return value
+
+    serialized = {}
+    for key in ["train_f1", "val_f1", "train_loss", "val_loss", "learning_rates"]:
+        serialized[key] = [
+            _to_float(v) for v in history.get(key, [])
+        ]
+
+    serialized["trends"] = []
+    for trend in history.get("trends", []):
+        if isinstance(trend, dict):
+            serialized["trends"].append({k: _to_float(v) for k, v in trend.items()})
+        else:
+            serialized["trends"].append(_to_float(trend))
+
+    return serialized
+
+
 def _prepare_threshold(threshold, num_classes: int, device: torch.device) -> torch.Tensor:
     """Return a tensor threshold of shape (num_classes,) on the target device.
 
@@ -304,7 +337,7 @@ def train_model(model, train_loader, val_loader, device, config, output_dir):
     
     # Save final training history
     with open(output_dir / 'training_history.json', 'w') as f:
-        json.dump(history, f, indent=2, default=lambda x: float(x) if isinstance(x, np.float32) else x)
+        json.dump(_serialize_history(history), f, indent=2)
     
     # Load best model
     if best_model_state is not None:

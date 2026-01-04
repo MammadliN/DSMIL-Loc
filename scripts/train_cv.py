@@ -29,6 +29,54 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+def _macro_f1(predictions: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    """Compute macro F1 for multi-label predictions."""
+    tp = (predictions * labels).sum(dim=0)
+    fp = (predictions * (1 - labels)).sum(dim=0)
+    fn = ((1 - predictions) * labels).sum(dim=0)
+
+    precision = tp / (tp + fp + 1e-8)
+    recall = tp / (tp + fn + 1e-8)
+    f1_per_class = 2 * precision * recall / (precision + recall + 1e-8)
+    return f1_per_class.mean()
+
+
+def _prepare_threshold(threshold, num_classes: int, device: torch.device) -> torch.Tensor:
+    """Return a tensor threshold of shape (num_classes,) on the target device.
+
+    Handles scalars, sequences, numpy arrays, and tensors. If a double-threshold
+    array is provided (shape ``[2, num_classes]``), the "on" row (index 0) is
+    used for clip-level comparisons inside training/validation.
+    """
+    # Convert to tensor on the right device/dtype
+    if isinstance(threshold, torch.Tensor):
+        threshold_tensor = threshold.to(device=device, dtype=torch.float32)
+    else:
+        threshold_tensor = torch.as_tensor(threshold, dtype=torch.float32, device=device)
+
+    # If double thresholds are passed, use the "on" thresholds for Task A logic
+    if threshold_tensor.ndim > 1 and threshold_tensor.shape[0] == 2:
+        threshold_tensor = threshold_tensor[0]
+
+    # Flatten and broadcast to the number of classes
+    threshold_tensor = threshold_tensor.flatten()
+    if threshold_tensor.numel() == 1:
+        threshold_tensor = threshold_tensor.expand(num_classes)
+    elif threshold_tensor.numel() != num_classes:
+        # Safeguard: truncate or pad (with the last value) to expected size
+        if threshold_tensor.numel() > num_classes:
+            threshold_tensor = threshold_tensor[:num_classes]
+        else:
+            pad_value = threshold_tensor[-1].item()
+            pad_len = num_classes - threshold_tensor.numel()
+            threshold_tensor = torch.cat([
+                threshold_tensor,
+                torch.full((pad_len,), pad_value, device=device, dtype=threshold_tensor.dtype)
+            ])
+
+    return threshold_tensor
+
+
 def train_epoch(model, loader, criterion, optimizer, device, config):
     """Run single training epoch with stability improvements"""
     epoch_metrics = {'loss': 0.0, 'f1': 0.0}
@@ -65,12 +113,12 @@ def train_epoch(model, loader, criterion, optimizer, device, config):
         epoch_metrics['loss'] += loss.item() / num_batches
         
         # Compute F1 score
-        predictions = (torch.sigmoid(outputs['logits']) > 0.5).float()
-        tp = torch.sum((predictions == 1) & (labels == 1)).float()
-        fp = torch.sum((predictions == 1) & (labels == 0)).float()
-        fn = torch.sum((predictions == 0) & (labels == 1)).float()
-        
-        batch_f1 = tp / (tp + 0.5 * (fp + fn)) if tp + fp + fn > 0 else torch.tensor(0.0)
+        evaluation_cfg = config.get('evaluation', {})
+        raw_threshold = evaluation_cfg.get('task_a_thresholds', 0.5)
+        threshold_tensor = _prepare_threshold(raw_threshold, outputs['logits'].shape[-1], device)
+        predictions = (torch.sigmoid(outputs['logits']) > threshold_tensor).float()
+
+        batch_f1 = _macro_f1(predictions, labels)
         epoch_metrics['f1'] += batch_f1.item() / num_batches
         
         # Log progress
@@ -79,13 +127,15 @@ def train_epoch(model, loader, criterion, optimizer, device, config):
     
     return epoch_metrics
 
-def evaluate(model, loader, criterion, device):
+def evaluate(model, loader, criterion, device, threshold=0.5):
     """Evaluate model on validation or test set"""
     model.eval()
     total_loss = 0
     predictions = []
     labels = []
     
+    threshold_tensor = None
+
     with torch.no_grad():
         for batch in tqdm(loader, desc="Evaluating"):
             if batch is None:
@@ -104,8 +154,14 @@ def evaluate(model, loader, criterion, device):
             # Store loss
             total_loss += loss.item()
             
+            # Lazily prepare threshold to match current batch/device
+            if threshold_tensor is None:
+                threshold_tensor = _prepare_threshold(
+                    threshold, outputs['logits'].shape[-1], device
+                )
+
             # Get predictions
-            batch_preds = (torch.sigmoid(outputs['logits']) > 0.5).float()
+            batch_preds = (torch.sigmoid(outputs['logits']) > threshold_tensor).float()
             
             # Store predictions and labels
             predictions.extend(batch_preds.cpu().numpy())
@@ -116,21 +172,25 @@ def evaluate(model, loader, criterion, device):
     labels = np.array(labels)
     
     # Compute metrics
-    tp = np.sum((predictions == 1) & (labels == 1))
-    fp = np.sum((predictions == 1) & (labels == 0))
-    fn = np.sum((predictions == 0) & (labels == 1))
-    tn = np.sum((predictions == 0) & (labels == 0))
-    
+    tp = (predictions * labels).sum(axis=0)
+    fp = (predictions * (1 - labels)).sum(axis=0)
+    fn = ((1 - predictions) * labels).sum(axis=0)
+    tn = ((1 - predictions) * (1 - labels)).sum(axis=0)
+
+    precision = np.divide(tp, tp + fp + 1e-8)
+    recall = np.divide(tp, tp + fn + 1e-8)
+    f1 = np.divide(2 * precision * recall, precision + recall + 1e-8)
+
     metrics = {
         'loss': total_loss / len(loader),
-        'accuracy': (tp + tn) / (tp + tn + fp + fn) if tp + tn + fp + fn > 0 else 0,
-        'precision': tp / (tp + fp) if tp + fp > 0 else 0,
-        'recall': tp / (tp + fn) if tp + fn > 0 else 0,
-        'f1': 2 * tp / (2 * tp + fp + fn) if 2 * tp + fp + fn > 0 else 0,
-        'true_positives': int(tp),
-        'false_positives': int(fp),
-        'false_negatives': int(fn),
-        'true_negatives': int(tn),
+        'accuracy': float(np.mean((tp + tn) / (tp + tn + fp + fn + 1e-8))),
+        'precision': float(np.mean(precision)),
+        'recall': float(np.mean(recall)),
+        'f1': float(np.mean(f1)),
+        'true_positives': tp.tolist(),
+        'false_positives': fp.tolist(),
+        'false_negatives': fn.tolist(),
+        'true_negatives': tn.tolist(),
         'predictions': predictions,
         'labels': labels
     }
@@ -158,8 +218,11 @@ def train_model(model, train_loader, val_loader, device, config, output_dir):
     )
     
     # Initialize loss criterion
+    pos_weight_cfg = config['training'].get('pos_weight')
+    pos_weight = torch.tensor(pos_weight_cfg, dtype=torch.float32).to(device) if pos_weight_cfg is not None else None
+
     criterion = StableMILLoss(
-        pos_weight=torch.tensor([3.5]).to(device),
+        pos_weight=pos_weight,
         smooth_factor=config['training']['label_smoothing'],
         focal_gamma=config['training']['focal_gamma']
     )
@@ -193,7 +256,9 @@ def train_model(model, train_loader, val_loader, device, config, output_dir):
         train_metrics = train_epoch(model, train_loader, criterion, optimizer, device, config)
         
         # Validation phase
-        val_metrics = evaluate(model, val_loader, criterion, device)
+        evaluation_cfg = config.get('evaluation', {})
+        val_threshold = evaluation_cfg.get('task_a_thresholds', 0.5)
+        val_metrics = evaluate(model, val_loader, criterion, device, threshold=val_threshold)
         
         # Update learning rate
         scheduler.step(val_metrics['f1'])
@@ -300,9 +365,9 @@ def run_cross_validation(data_dir, site_years, config):
         logger.info(f"Fold {fold}: Training on {train_sites}, validating on {val_site}, testing on {test_site}")
         
         # Create datasets
-        train_dataset = LocalizationDataset(data_dir, train_sites, preload_data=False)
-        val_dataset = LocalizationDataset(data_dir, [val_site], preload_data=False)
-        test_dataset = LocalizationDataset(data_dir, [test_site], preload_data=False)
+        train_dataset = LocalizationDataset(data_dir, train_sites, preload_data=False, num_classes=config['model'].get('num_classes', 1))
+        val_dataset = LocalizationDataset(data_dir, [val_site], preload_data=False, num_classes=config['model'].get('num_classes', 1))
+        test_dataset = LocalizationDataset(data_dir, [test_site], preload_data=False, num_classes=config['model'].get('num_classes', 1))
         
         # Create dataloaders
         train_loader = DataLoader(
@@ -332,7 +397,8 @@ def run_cross_validation(data_dir, site_years, config):
         # Initialize model
         model = ImprovedLocalizationMILNet(
             feature_dim=config['model']['feature_dim'],
-            num_heads=config['model']['num_heads']
+            num_heads=config['model']['num_heads'],
+            num_classes=config['model'].get('num_classes', 1)
         ).to(device)
         
         # Train model
@@ -347,13 +413,15 @@ def run_cross_validation(data_dir, site_years, config):
         
         # Initialize loss criterion for evaluation
         criterion = StableMILLoss(
-            pos_weight=torch.tensor([3.5]).to(device),
+            pos_weight=pos_weight,
             smooth_factor=config['training']['label_smoothing'],
             focal_gamma=config['training']['focal_gamma']
         )
         
         # Evaluate on test set
-        test_metrics = evaluate(trained_model, test_loader, criterion, device)
+        evaluation_cfg = config.get('evaluation', {})
+        test_threshold = evaluation_cfg.get('task_a_thresholds', 0.5)
+        test_metrics = evaluate(trained_model, test_loader, criterion, device, threshold=test_threshold)
         
         # Visualize results
         visualizer = ResultVisualizer(save_dir=fold_dir)

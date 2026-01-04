@@ -11,13 +11,14 @@ import torch.nn.functional as F
 
 class LocalizationDataset(Dataset):
     def __init__(self, data_dir: str, site_years: Optional[List[str]] = None,
-                 cache_size: int = 1000000, num_workers: int = 8, 
-                 preload_data: bool = False):
+                 cache_size: int = 1000000, num_workers: int = 8,
+                 preload_data: bool = False, num_classes: int = 1):
         super().__init__()
         self.data_dir = Path(data_dir)
         self.site_years = site_years if site_years else self._get_available_site_years()
         self.cache_size = cache_size
         self.num_workers = num_workers
+        self.num_classes = num_classes
         
         # Define feature keys
         self.temporal_feature_keys = [
@@ -55,6 +56,18 @@ class LocalizationDataset(Dataset):
         """Get all available site years from the data directory"""
         return [d.name for d in self.data_dir.iterdir() if d.is_dir()]
 
+    def _labels_to_multihot(self, labels: List) -> np.ndarray:
+        """Convert label list (indices or names) to a multi-hot vector."""
+        multihot = np.zeros(self.num_classes, dtype=np.float32)
+        for label in labels or []:
+            try:
+                idx = int(label)
+                if 0 <= idx < self.num_classes:
+                    multihot[idx] = 1.0
+            except (ValueError, TypeError):
+                continue
+        return multihot
+
     def load_instance_parallel(self, bag_dir: Path, i: int, target_shape=(129, 235)):
         """Load single instance data in parallel"""
         try:
@@ -82,7 +95,9 @@ class LocalizationDataset(Dataset):
             for key in self.physics_feature_keys:
                 feature_vector.append(float(instance_data['physics_features'].get(key, 0.0)))
 
-            return i, spectrogram, feature_vector, instance_data.get('start_time'), instance_data.get('labels', [])
+            instance_labels = self._labels_to_multihot(instance_data.get('labels', []))
+
+            return i, spectrogram, feature_vector, instance_data.get('start_time'), instance_labels
 
         except Exception as e:
             print(f"Error loading instance {i}: {e}")
@@ -117,8 +132,12 @@ class LocalizationDataset(Dataset):
                     metadata['bag_dir'] = str(bag_dir)
                     metadata['site_year'] = site_year
                     
-                    # Bag label is directly available from has_calls
-                    metadata['bag_label'] = 1 if metadata['has_calls'] else 0
+                    # Bag labels: prefer explicit list, otherwise binary whale presence in first class
+                    metadata['bag_labels'] = (
+                        self._labels_to_multihot(metadata.get('labels', []))
+                        if 'labels' in metadata else
+                        self._labels_to_multihot([0]) if metadata.get('has_calls', False) else np.zeros(self.num_classes)
+                    )
                     
                     all_bags.append(metadata)
                     
@@ -167,24 +186,26 @@ class LocalizationDataset(Dataset):
                         instance_time = base_time + timedelta(seconds=i * instance_duration)
                         instance_timestamps.append(instance_time.timestamp())
                     
-                    # Set instance label (1 if has calls, 0 otherwise)
-                    instance_labels.append(1 if labels else 0)
+                    instance_labels.append(labels)
         
         if len(spectrograms) == 0:
             raise ValueError(f"No valid instances found in bag {bag['bag_id']}")
-        
+
         # Create instance labels if not already set
         if not instance_labels:
-            instance_labels = np.zeros(bag['n_instances'])
-            if bag['has_calls']:
-                for call_info in bag['instances_with_calls']:
-                    instance_labels[call_info['instance_idx']] = 1
+            instance_labels = np.zeros((bag['n_instances'], self.num_classes))
+            if bag.get('has_calls'):
+                for call_info in bag.get('instances_with_calls', []):
+                    idx = call_info['instance_idx']
+                    instance_labels[idx, 0] = 1
+        else:
+            instance_labels = np.stack(instance_labels)
         
         return {
             'bag_id': bag['bag_id'],
             'spectrograms': torch.FloatTensor(np.stack(spectrograms)),
             'features': torch.FloatTensor(np.array(features)),
-            'bag_label': torch.tensor(bag['bag_label'], dtype=torch.float32),
+            'bag_label': torch.tensor(bag['bag_labels'], dtype=torch.float32),
             'num_instances': torch.tensor(len(spectrograms), dtype=torch.long),
             'site': bag['site_year'],
             'instance_timestamps': instance_timestamps,

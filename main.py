@@ -21,7 +21,7 @@ from utils.config_loader import get_default_config
 
 
 # Path to the root directory of AnuraSet
-ANURASET_ROOT = Path("/path/to/AnuraSet")
+ANURASET_ROOT = Path(r"C:\\Users\\noma01\\PycharmProjects\\WSSED\\PAM datasets\\AnuraSet\\audio")
 
 
 @dataclass
@@ -534,7 +534,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--fraction",
         type=float,
-        default=1.0,
+        default=0.1,
         help="Single fraction of each split to use (0-1], e.g., 0.1 for 10% quick run",
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed for fractional sampling")

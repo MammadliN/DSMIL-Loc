@@ -459,11 +459,13 @@ def run_pipeline(
     val_fraction: float = VALIDATION_FRACTION,
     early_stopping: bool = False,
     early_stopping_patience: int = 3,
+    num_epochs: int = 1000,
+    batch_size: int = 2,
 ):
     config = get_default_config()
     config["paths"]["results_dir"] = str(Path("results") / "anuraset")
-    config["training"]["num_epochs"] = 1000
-    config["training"]["batch_size"] = 2
+    config["training"]["num_epochs"] = num_epochs
+    config["training"]["batch_size"] = batch_size
     config["training"]["device"] = "cuda" if torch.cuda.is_available() else "cpu"
     config["training"]["patience"] = early_stopping_patience
 
@@ -627,6 +629,11 @@ def run_pipeline(
 
 
 if __name__ == "__main__":
+    # Easy-to-edit defaults
+    default_val_fraction = 0.0  # keep validation disabled by default
+    default_num_epochs = 1000
+    default_batch_size = 2
+
     parser = argparse.ArgumentParser(description="Run AnuraSet MIL pipeline")
     parser.add_argument("--root", type=Path, default=ANURASET_ROOT, help="Path to AnuraSet root directory")
     parser.add_argument(
@@ -639,7 +646,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--val-fraction",
         type=float,
-        default=VALIDATION_FRACTION,
+        default=default_val_fraction,
         help="Fraction of training recordings to hold out as validation (0 disables validation)",
     )
     parser.add_argument(
@@ -653,6 +660,18 @@ if __name__ == "__main__":
         default=3,
         help="Patience for early stopping when enabled",
     )
+    parser.add_argument(
+        "--num-epochs",
+        type=int,
+        default=default_num_epochs,
+        help="Number of training epochs",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=default_batch_size,
+        help="Training batch size",
+    )
 
     args = parser.parse_args()
 
@@ -663,4 +682,6 @@ if __name__ == "__main__":
         val_fraction=args.val_fraction,
         early_stopping=args.early_stopping,
         early_stopping_patience=args.early_stopping_patience,
+        num_epochs=args.num_epochs,
+        batch_size=args.batch_size,
     )

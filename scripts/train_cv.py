@@ -59,10 +59,16 @@ def _serialize_history(history: dict) -> dict:
         return value
 
     serialized = {}
-    for key in ["train_f1", "val_f1", "train_loss", "val_loss", "learning_rates"]:
-        serialized[key] = [
-            _to_float(v) for v in history.get(key, [])
-        ]
+    for key in [
+        "train_f1_05",
+        "train_f1_02",
+        "val_f1_05",
+        "val_f1_02",
+        "train_loss",
+        "val_loss",
+        "learning_rates",
+    ]:
+        serialized[key] = [_to_float(v) for v in history.get(key, [])]
 
     serialized["trends"] = []
     for trend in history.get("trends", []):
@@ -112,7 +118,7 @@ def _prepare_threshold(threshold, num_classes: int, device: torch.device) -> tor
 
 def train_epoch(model, loader, criterion, optimizer, device, config):
     """Run single training epoch with stability improvements"""
-    epoch_metrics = {'loss': 0.0, 'f1': 0.0}
+    epoch_metrics = {"loss": 0.0, "f1_05": 0.0, "f1_02": 0.0}
     num_batches = len(loader)
     model.train()
     
@@ -145,29 +151,43 @@ def train_epoch(model, loader, criterion, optimizer, device, config):
         # Update metrics
         epoch_metrics['loss'] += loss.item() / num_batches
         
-        # Compute F1 score
-        evaluation_cfg = config.get('evaluation', {})
-        raw_threshold = evaluation_cfg.get('task_a_thresholds', 0.5)
-        threshold_tensor = _prepare_threshold(raw_threshold, outputs['logits'].shape[-1], device)
-        predictions = (torch.sigmoid(outputs['logits']) > threshold_tensor).float()
+        # Compute F1 scores at fixed decision thresholds
+        logits = outputs['logits']
+        th_05 = torch.full((logits.shape[-1],), 0.5, device=device)
+        th_02 = torch.full((logits.shape[-1],), 0.2, device=device)
 
-        batch_f1 = _macro_f1(predictions, labels)
-        epoch_metrics['f1'] += batch_f1.item() / num_batches
-        
+        preds_05 = (torch.sigmoid(logits) > th_05).float()
+        preds_02 = (torch.sigmoid(logits) > th_02).float()
+
+        epoch_metrics['f1_05'] += _macro_f1(preds_05, labels).item() / num_batches
+        epoch_metrics['f1_02'] += _macro_f1(preds_02, labels).item() / num_batches
+
         # Log progress
         if (batch_idx + 1) % config['logging']['log_every'] == 0:
-            logger.info(f"Batch {batch_idx+1}/{num_batches} - Loss: {loss.item():.4f}, F1: {batch_f1.item():.4f}")
-    
+            logger.info(
+                "Batch {}/{} - Loss: {:.4f}, F1@0.5: {:.4f}, F1@0.2: {:.4f}".format(
+                    batch_idx + 1,
+                    num_batches,
+                    loss.item(),
+                    epoch_metrics['f1_05'] * num_batches / (batch_idx + 1),
+                    epoch_metrics['f1_02'] * num_batches / (batch_idx + 1),
+                )
+            )
+
     return epoch_metrics
 
 def evaluate(model, loader, criterion, device, threshold=0.5):
-    """Evaluate model on validation or test set"""
+    """Evaluate model on validation or test set with multiple thresholds."""
     model.eval()
     total_loss = 0
-    predictions = []
+    predictions_tuned = []
+    predictions_05 = []
+    predictions_02 = []
     labels = []
-    
+
     threshold_tensor = None
+    th_05 = None
+    th_02 = None
 
     with torch.no_grad():
         for batch in tqdm(loader, desc="Evaluating"):
@@ -187,47 +207,67 @@ def evaluate(model, loader, criterion, device, threshold=0.5):
             # Store loss
             total_loss += loss.item()
             
-            # Lazily prepare threshold to match current batch/device
+            # Lazily prepare thresholds to match current batch/device
             if threshold_tensor is None:
                 threshold_tensor = _prepare_threshold(
                     threshold, outputs['logits'].shape[-1], device
                 )
+                th_05 = torch.full((outputs['logits'].shape[-1],), 0.5, device=device)
+                th_02 = torch.full((outputs['logits'].shape[-1],), 0.2, device=device)
 
             # Get predictions
-            batch_preds = (torch.sigmoid(outputs['logits']) > threshold_tensor).float()
-            
+            sig = torch.sigmoid(outputs['logits'])
+            batch_preds_tuned = (sig > threshold_tensor).float()
+            batch_preds_05 = (sig > th_05).float()
+            batch_preds_02 = (sig > th_02).float()
+
             # Store predictions and labels
-            predictions.extend(batch_preds.cpu().numpy())
+            predictions_tuned.extend(batch_preds_tuned.cpu().numpy())
+            predictions_05.extend(batch_preds_05.cpu().numpy())
+            predictions_02.extend(batch_preds_02.cpu().numpy())
             labels.extend(batch_labels.cpu().numpy())
     
     # Convert to numpy arrays
-    predictions = np.array(predictions)
+    predictions_tuned = np.array(predictions_tuned)
+    predictions_05 = np.array(predictions_05)
+    predictions_02 = np.array(predictions_02)
     labels = np.array(labels)
-    
-    # Compute metrics
-    tp = (predictions * labels).sum(axis=0)
-    fp = (predictions * (1 - labels)).sum(axis=0)
-    fn = ((1 - predictions) * labels).sum(axis=0)
-    tn = ((1 - predictions) * (1 - labels)).sum(axis=0)
 
-    precision = np.divide(tp, tp + fp + 1e-8)
-    recall = np.divide(tp, tp + fn + 1e-8)
-    f1 = np.divide(2 * precision * recall, precision + recall + 1e-8)
+    def _np_macro_f1(preds: np.ndarray, lbls: np.ndarray) -> float:
+        tp = (preds * lbls).sum(axis=0)
+        fp = (preds * (1 - lbls)).sum(axis=0)
+        fn = ((1 - preds) * lbls).sum(axis=0)
+        precision = np.divide(tp, tp + fp + 1e-8)
+        recall = np.divide(tp, tp + fn + 1e-8)
+        f1 = np.divide(2 * precision * recall, precision + recall + 1e-8)
+        return float(np.mean(f1))
+
+    tp = (predictions_tuned * labels).sum(axis=0)
+    fp = (predictions_tuned * (1 - labels)).sum(axis=0)
+    fn = ((1 - predictions_tuned) * labels).sum(axis=0)
+    tn = ((1 - predictions_tuned) * (1 - labels)).sum(axis=0)
 
     metrics = {
         'loss': total_loss / len(loader),
         'accuracy': float(np.mean((tp + tn) / (tp + tn + fp + fn + 1e-8))),
-        'precision': float(np.mean(precision)),
-        'recall': float(np.mean(recall)),
-        'f1': float(np.mean(f1)),
+        'precision': float(np.mean(np.divide(tp, tp + fp + 1e-8))),
+        'recall': float(np.mean(np.divide(tp, tp + fn + 1e-8))),
+        'f1_tuned': _np_macro_f1(predictions_tuned, labels),
+        'f1_05': _np_macro_f1(predictions_05, labels),
+        'f1_02': _np_macro_f1(predictions_02, labels),
         'true_positives': tp.tolist(),
         'false_positives': fp.tolist(),
         'false_negatives': fn.tolist(),
         'true_negatives': tn.tolist(),
-        'predictions': predictions,
-        'labels': labels
+        'predictions': predictions_tuned,
+        'predictions_05': predictions_05,
+        'predictions_02': predictions_02,
+        'predictions_tuned': predictions_tuned,
+        'labels': labels,
     }
-    
+    # preserve legacy key for downstream consumers
+    metrics['f1'] = metrics['f1_tuned']
+
     return metrics
 
 def train_model(
@@ -281,8 +321,10 @@ def train_model(
     
     # Training history
     history = {
-        'train_f1': [],
-        'val_f1': [],
+        'train_f1_05': [],
+        'train_f1_02': [],
+        'val_f1_05': [],
+        'val_f1_02': [],
         'train_loss': [],
         'val_loss': [],
         'learning_rates': [],
@@ -293,6 +335,7 @@ def train_model(
     checkpoint_path = output_dir / 'best_model.pt'
     best_model_state = None
     best_metric = -float('inf')
+    best_metric_name = 'Val F1@0.2'
     
     logger.info("Starting training...")
     for epoch in range(config['training']['num_epochs']):
@@ -306,38 +349,52 @@ def train_model(
             val_metrics = evaluate(model, val_loader, criterion, device, threshold=val_threshold)
         else:
             val_metrics = None
-        
+
         # Update learning rate
-        metric_for_scheduler = val_metrics['f1'] if val_metrics is not None else train_metrics['f1']
+        metric_for_scheduler = (
+            val_metrics['f1_02'] if val_metrics is not None else train_metrics['f1_02']
+        )
         scheduler.step(metric_for_scheduler)
-        
+
         # Store history
-        history['train_f1'].append(train_metrics['f1'])
-        history['val_f1'].append(val_metrics['f1'] if val_metrics is not None else train_metrics['f1'])
+        history['train_f1_05'].append(train_metrics['f1_05'])
+        history['train_f1_02'].append(train_metrics['f1_02'])
+        history['val_f1_05'].append(val_metrics['f1_05'] if val_metrics is not None else train_metrics['f1_05'])
+        history['val_f1_02'].append(val_metrics['f1_02'] if val_metrics is not None else train_metrics['f1_02'])
         history['train_loss'].append(train_metrics['loss'])
         history['val_loss'].append(val_metrics['loss'] if val_metrics is not None else train_metrics['loss'])
         history['learning_rates'].append(optimizer.param_groups[0]['lr'])
-        
+
         # Print epoch summary
         logger.info(f"\nEpoch {epoch+1}:")
-        logger.info(f"Train Loss: {train_metrics['loss']:.4f}, F1: {train_metrics['f1']:.4f}")
+        logger.info(
+            "Train Loss: {:.4f}, F1@0.5: {:.4f}, F1@0.2: {:.4f}".format(
+                train_metrics['loss'], train_metrics['f1_05'], train_metrics['f1_02']
+            )
+        )
         if val_metrics is not None:
-            logger.info(f"Val Loss: {val_metrics['loss']:.4f}, F1: {val_metrics['f1']:.4f}")
+            logger.info(
+                "Val Loss: {:.4f}, F1@0.5: {:.4f}, F1@0.2: {:.4f}".format(
+                    val_metrics['loss'], val_metrics['f1_05'], val_metrics['f1_02']
+                )
+            )
         else:
             logger.info("Validation skipped (no validation loader)")
-        
+
         # Check early stopping with trend analysis
         trend_info = {'status': 'disabled'}
         should_stop = False
-        metric_for_selection = val_metrics['f1'] if val_metrics is not None else train_metrics['f1']
+        metric_for_selection = (
+            val_metrics['f1_02'] if val_metrics is not None else train_metrics['f1_02']
+        )
         if early_stopping is not None:
             should_stop, trend_info = early_stopping(metric_for_selection, epoch)
         history['trends'].append(trend_info)
-        
+
         # Save best model
         if metric_for_selection > best_metric:
             best_metric = metric_for_selection
-            logger.info(f"New best model! F1: {metric_for_selection:.4f}")
+            logger.info(f"New best model based on {best_metric_name}: {metric_for_selection:.4f}")
             best_model_state = {
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
@@ -375,6 +432,8 @@ def print_metrics(metrics):
     precision = metrics.get('precision')
     recall = metrics.get('recall')
     f1 = metrics.get('f1')
+    f1_05 = metrics.get('f1_05')
+    f1_02 = metrics.get('f1_02')
     if accuracy is not None:
         logger.info(f"Accuracy: {accuracy:.4f}")
     if precision is not None:
@@ -382,7 +441,11 @@ def print_metrics(metrics):
     if recall is not None:
         logger.info(f"Recall: {recall:.4f}")
     if f1 is not None:
-        logger.info(f"F1 Score: {f1:.4f}")
+        logger.info(f"F1 (tuned threshold): {f1:.4f}")
+    if f1_05 is not None:
+        logger.info(f"F1@0.5: {f1_05:.4f}")
+    if f1_02 is not None:
+        logger.info(f"F1@0.2: {f1_02:.4f}")
     if 'true_positives' in metrics:
         logger.info(f"True Positives: {metrics['true_positives']}")
     if 'false_positives' in metrics:

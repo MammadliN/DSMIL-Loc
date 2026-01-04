@@ -1,9 +1,10 @@
 import argparse
 import json
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import librosa
 import numpy as np
@@ -24,6 +25,10 @@ from utils.config_loader import get_default_config
 ANURASET_ROOT = Path(r"C:\\Users\\noma01\\PycharmProjects\\WSSED\\PAM datasets\\AnuraSet\\audio")
 # Fraction of training set to carve out as validation (0.0 disables validation)
 VALIDATION_FRACTION = 0.0
+
+logger = logging.getLogger(__name__)
+if not logging.getLogger().handlers:
+    logging.basicConfig(level=logging.INFO)
 
 
 @dataclass
@@ -193,6 +198,17 @@ class AnuraSetBagDataset(Dataset):
         }
 
 
+def _macro_f1_np(preds: np.ndarray, labels: np.ndarray) -> float:
+    tp = (preds * labels).sum(axis=0)
+    fp = (preds * (1 - labels)).sum(axis=0)
+    fn = ((1 - preds) * labels).sum(axis=0)
+
+    precision = tp / (tp + fp + 1e-8)
+    recall = tp / (tp + fn + 1e-8)
+    f1 = 2 * precision * recall / (precision + recall + 1e-8)
+    return float(np.mean(f1))
+
+
 def _optimize_task_a_thresholds(probs: np.ndarray, labels: np.ndarray, step: float = 0.01, max_iter: int = 50) -> np.ndarray:
     thresholds = np.full(labels.shape[1], 0.5, dtype=np.float32)
 
@@ -221,17 +237,6 @@ def _optimize_task_a_thresholds(probs: np.ndarray, labels: np.ndarray, step: flo
         if not improved:
             break
     return thresholds
-
-
-def _macro_f1_np(preds: np.ndarray, labels: np.ndarray) -> float:
-    tp = (preds * labels).sum(axis=0)
-    fp = (preds * (1 - labels)).sum(axis=0)
-    fn = ((1 - preds) * labels).sum(axis=0)
-
-    precision = tp / (tp + fp + 1e-8)
-    recall = tp / (tp + fn + 1e-8)
-    f1 = 2 * precision * recall / (precision + recall + 1e-8)
-    return float(np.mean(f1))
 
 
 def _optimize_task_b_single(instance_probs: np.ndarray, instance_labels: np.ndarray, step: float = 0.01, max_iter: int = 50) -> np.ndarray:
@@ -431,13 +436,19 @@ def prepare_datasets(
     fraction: float = 1.0,
     seed: int = 42,
     val_fraction: float = VALIDATION_FRACTION,
+    target_species: Optional[List[str]] = None,
 ) -> Tuple[AnuraSetBagDataset, AnuraSetBagDataset, AnuraSetBagDataset, List[str]]:
     metadata_path = root_dir / "metadata.csv"
     metadata = pd.read_csv(metadata_path)
 
     # class columns are all columns after subset
     subset_idx = list(metadata.columns).index("subset")
-    class_columns = metadata.columns[subset_idx + 1 :].tolist()
+    all_class_columns = metadata.columns[subset_idx + 1 :].tolist()
+    if target_species:
+        filtered = [c for c in target_species if c in all_class_columns]
+        class_columns = filtered if filtered else all_class_columns
+    else:
+        class_columns = all_class_columns
 
     metadata = _create_validation_split(metadata, class_columns, val_fraction=val_fraction, seed=seed)
 
@@ -461,6 +472,7 @@ def run_pipeline(
     early_stopping_patience: int = 3,
     num_epochs: int = 1000,
     batch_size: int = 2,
+    target_species: Optional[List[str]] = None,
 ):
     config = get_default_config()
     config["paths"]["results_dir"] = str(Path("results") / "anuraset")
@@ -470,7 +482,11 @@ def run_pipeline(
     config["training"]["patience"] = early_stopping_patience
 
     train_ds, val_ds, test_ds, class_columns = prepare_datasets(
-        root_dir, fraction=fraction, seed=seed, val_fraction=val_fraction
+        root_dir,
+        fraction=fraction,
+        seed=seed,
+        val_fraction=val_fraction,
+        target_species=target_species,
     )
     num_classes = len(class_columns)
 
@@ -554,6 +570,28 @@ def run_pipeline(
         tune_inst_counts,
     ) = _collect_outputs(model, tuning_eval_loader, device)
 
+    val_f1a_05 = _macro_f1_np((tune_bag_probs > 0.5).astype(float), tune_bag_labels)
+    val_f1a_02 = _macro_f1_np((tune_bag_probs > 0.2).astype(float), tune_bag_labels)
+    logger.info(
+        "Validation (Task A) fixed thresholds — F1@0.5: %.4f, F1@0.2: %.4f",
+        val_f1a_05,
+        val_f1a_02,
+    )
+
+    val_f1b_05 = _macro_f1_np(
+        (tune_inst_probs > 0.5).astype(float).reshape(-1, tune_inst_probs.shape[-1]),
+        tune_inst_labels.reshape(-1, tune_inst_labels.shape[-1]),
+    )
+    val_f1b_02 = _macro_f1_np(
+        (tune_inst_probs > 0.2).astype(float).reshape(-1, tune_inst_probs.shape[-1]),
+        tune_inst_labels.reshape(-1, tune_inst_labels.shape[-1]),
+    )
+    logger.info(
+        "Validation (Task B) fixed thresholds — F1@0.5: %.4f, F1@0.2: %.4f",
+        val_f1b_05,
+        val_f1b_02,
+    )
+
     task_a_thresholds = _optimize_task_a_thresholds(tune_bag_probs, tune_bag_labels)
     task_b_single_thresholds = _optimize_task_b_single(tune_inst_probs, tune_inst_labels)
     task_b_double_thresholds = _optimize_task_b_double(tune_inst_probs, tune_inst_labels, tune_inst_counts)
@@ -594,6 +632,20 @@ def run_pipeline(
         test_inst_counts,
     ) = _collect_outputs(model, test_eval_loader, device)
 
+    test_f1b_05 = _macro_f1_np(
+        (test_inst_probs > 0.5).astype(float).reshape(-1, test_inst_probs.shape[-1]),
+        test_inst_labels.reshape(-1, test_inst_labels.shape[-1]),
+    )
+    test_f1b_02 = _macro_f1_np(
+        (test_inst_probs > 0.2).astype(float).reshape(-1, test_inst_probs.shape[-1]),
+        test_inst_labels.reshape(-1, test_inst_labels.shape[-1]),
+    )
+    logger.info(
+        "Test (Task B) fixed thresholds — F1@0.5: %.4f, F1@0.2: %.4f",
+        test_f1b_05,
+        test_f1b_02,
+    )
+
     task_b_single_preds = (test_inst_probs > task_b_single_thresholds).astype(float)
     task_b_single_f1 = _macro_f1_np(
         task_b_single_preds.reshape(-1, task_b_single_preds.shape[-1]),
@@ -623,6 +675,8 @@ def run_pipeline(
             {
                 "single_threshold_macro_f1": task_b_single_f1,
                 "double_threshold_macro_f1": task_b_double_f1,
+                "fixed_threshold_f1_05": test_f1b_05,
+                "fixed_threshold_f1_02": test_f1b_02,
             },
             f,
             indent=2,
@@ -634,6 +688,20 @@ if __name__ == "__main__":
     default_val_fraction = 0.0  # keep validation disabled by default
     default_num_epochs = 1000
     default_batch_size = 2
+
+    # Leave this list empty to train on all 42 species; otherwise only these
+    # columns are used throughout the pipeline.
+    TARGET_SPECIES = [
+        "DENMIN",
+        "LEPLAT",
+        "PHYCUV",
+        "SPHSUR",
+        "SCIPER",
+        "BOABIS",
+        "BOAFAB",
+        "LEPPOD",
+        "PHYALB",
+    ]
 
     parser = argparse.ArgumentParser(description="Run AnuraSet MIL pipeline")
     parser.add_argument("--root", type=Path, default=ANURASET_ROOT, help="Path to AnuraSet root directory")
@@ -685,4 +753,5 @@ if __name__ == "__main__":
         early_stopping_patience=args.early_stopping_patience,
         num_epochs=args.num_epochs,
         batch_size=args.batch_size,
+        target_species=TARGET_SPECIES,
     )

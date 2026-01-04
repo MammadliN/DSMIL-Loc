@@ -334,6 +334,67 @@ def _collect_outputs(model: ImprovedLocalizationMILNet, loader: DataLoader, devi
     )
 
 
+def _create_validation_split(
+    metadata: pd.DataFrame,
+    class_columns: List[str],
+    val_fraction: float = 0.15,
+    seed: int = 42,
+) -> pd.DataFrame:
+    """Split training recordings into train/validation by 60s source clip.
+
+    The dataset only provides train/test in the CSV. We build a validation set by
+    sampling 60-second base clips (identified by the fname within each site) so
+    that all 3-second windows from the same clip stay together. We also try to
+    ensure every class has at least one positive recording in validation.
+    """
+
+    rng = np.random.default_rng(seed)
+
+    train_df = metadata[metadata["subset"] == "train"].copy()
+    other_df = metadata[metadata["subset"] != "train"].copy()
+
+    if train_df.empty:
+        return metadata.copy()
+
+    train_groups = train_df[["site", "fname"]].drop_duplicates()
+    if train_groups.empty:
+        return metadata.copy()
+
+    n_val = max(1, int(round(len(train_groups) * val_fraction)))
+    sampled_idx = train_groups.sample(n=n_val, random_state=seed).reset_index(drop=True)
+    sampled_keys = set(map(tuple, sampled_idx.values))
+
+    train_mask = train_df.apply(lambda r: (r["site"], r["fname"]) in sampled_keys, axis=1)
+    val_df = train_df[train_mask].copy()
+    remaining_train = train_df[~train_mask].copy()
+
+    # Ensure validation has at least one positive clip per class when possible
+    for cls in class_columns:
+        if val_df[cls].sum() > 0:
+            continue
+
+        # find a remaining recording with a positive label for this class
+        positive_groups = (
+            remaining_train.groupby(["site", "fname"]).filter(lambda g: g[cls].sum() > 0)
+        )
+        if positive_groups.empty:
+            continue
+
+        candidate_keys = positive_groups[["site", "fname"]].drop_duplicates()
+        chosen = candidate_keys.sample(n=1, random_state=rng.integers(0, 1_000_000)).iloc[0]
+        move_mask = (remaining_train["site"] == chosen["site"]) & (
+            remaining_train["fname"] == chosen["fname"]
+        )
+
+        val_df = pd.concat([val_df, remaining_train[move_mask]], ignore_index=True)
+        remaining_train = remaining_train[~move_mask]
+
+    val_df.loc[:, "subset"] = "validation"
+    remaining_train.loc[:, "subset"] = "train"
+
+    return pd.concat([remaining_train, val_df, other_df], ignore_index=True)
+
+
 def _sample_subset(meta: pd.DataFrame, subset: str, fraction: float, seed: int) -> pd.DataFrame:
     if not (0 < fraction <= 1):
         raise ValueError(f"Fraction for {subset} must be in (0, 1], got {fraction}")
@@ -354,6 +415,8 @@ def prepare_datasets(
     # class columns are all columns after subset
     subset_idx = list(metadata.columns).index("subset")
     class_columns = metadata.columns[subset_idx + 1 :].tolist()
+
+    metadata = _create_validation_split(metadata, class_columns, val_fraction=0.15, seed=seed)
 
     train_meta = _sample_subset(metadata, "train", fraction, seed)
     val_meta = _sample_subset(metadata, "validation", fraction, seed)

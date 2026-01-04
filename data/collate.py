@@ -52,7 +52,7 @@ def collate_localization_bags(batch):
     for item in batch:
         try:
             # Build ground truth from instance labels
-            instance_labels = torch.zeros(min_instances)
+            instance_labels = torch.zeros((min_instances, item['instance_labels'].shape[-1]))
             instance_times = []
             ground_truth_calls = []
             
@@ -62,8 +62,8 @@ def collate_localization_bags(batch):
                 instance_times.append(item['instance_timestamps'][i])
                 
                 # Check if instance has any calls (non-empty labels)
-                if item['instance_labels'][i]:
-                    instance_labels[i] = 1
+                if item['instance_labels'][i].sum() > 0:
+                    instance_labels[i] = item['instance_labels'][i]
                     ground_truth_calls.append({
                         'start_time': item['instance_timestamps'][i],
                         'duration': 15.0  # Instance duration

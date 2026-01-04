@@ -22,7 +22,7 @@ from utils.config_loader import get_default_config
 
 
 # Path to the root directory of AnuraSet
-ANURASET_ROOT = Path(r"C:\\Users\\noma01\\PycharmProjects\\WSSED\\PAM datasets\\AnuraSet\\audio")
+ANURASET_ROOT = Path(r"/ds-iml/Bioacoustics/AnuraSet/anuraset/audio")
 # Fraction of training set to carve out as validation (0.0 disables validation)
 VALIDATION_FRACTION = 0.0
 
@@ -687,7 +687,7 @@ if __name__ == "__main__":
     # Easy-to-edit defaults
     default_val_fraction = 0.0  # keep validation disabled by default
     default_num_epochs = 1000
-    default_batch_size = 2
+    default_batch_size = 32
 
     # Leave this list empty to train on all 42 species; otherwise only these
     # columns are used throughout the pipeline.
@@ -708,7 +708,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--fraction",
         type=float,
-        default=0.1,
+        default=1.0,
         help="Single fraction of each split to use (0-1], e.g., 0.1 for 10% quick run",
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed for fractional sampling")

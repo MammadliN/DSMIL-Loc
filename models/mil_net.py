@@ -76,8 +76,10 @@ class GateModule(nn.Module):
 
 class ImprovedLocalizationMILNet(nn.Module):
 
-    def __init__(self, feature_dim: int = 128, num_heads: int = 4):
+    def __init__(self, feature_dim: int = 128, num_heads: int = 4, num_classes: int = 1):
         super().__init__()
+
+        self.num_classes = num_classes
         
         # Increased embedding dimension to match combined features
         COMBINED_DIM = 1024
@@ -130,7 +132,7 @@ class ImprovedLocalizationMILNet(nn.Module):
             nn.Linear(COMBINED_DIM, COMBINED_DIM),
             nn.LayerNorm(COMBINED_DIM),
             GateModule(COMBINED_DIM),
-            nn.Linear(COMBINED_DIM, 1)
+            nn.Linear(COMBINED_DIM, num_classes)
         )
         
         # Bag classifier with multiple heads - adjust for new dimension
@@ -216,15 +218,15 @@ class ImprovedLocalizationMILNet(nn.Module):
         instance_scores = self.instance_scorer(torch.cat([attended_features, combined], dim=-1))
         instance_scores = instance_scores.masked_fill(~mask.unsqueeze(-1), float('-inf'))
         attention_weights = F.softmax(instance_scores / self.temperature, dim=1)
-        
-        # Weighted pooling
-        bag_embedding = torch.sum(attended_features * attention_weights, dim=1)
+
+        # Weighted pooling per class
+        bag_embedding = torch.einsum('bnd,bnc->bcd', attended_features, attention_weights)
         
         # Multi-head classification
         logits = []
         for classifier in self.classifier:
             logits.append(classifier(bag_embedding))
-        logits = torch.mean(torch.stack(logits, dim=1), dim=1)
+        logits = torch.mean(torch.stack(logits, dim=1), dim=1).squeeze(-1)
         
         return {
             'logits': logits,

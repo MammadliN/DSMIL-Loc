@@ -42,13 +42,38 @@ def _macro_f1(predictions: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
 
 
 def _prepare_threshold(threshold, num_classes: int, device: torch.device) -> torch.Tensor:
-    """Return a tensor threshold of shape (num_classes,) on the target device."""
-    if isinstance(threshold, (float, int)):
-        return torch.full((num_classes,), float(threshold), device=device)
+    """Return a tensor threshold of shape (num_classes,) on the target device.
 
-    threshold_tensor = torch.as_tensor(threshold, dtype=torch.float32, device=device)
+    Handles scalars, sequences, numpy arrays, and tensors. If a double-threshold
+    array is provided (shape ``[2, num_classes]``), the "on" row (index 0) is
+    used for clip-level comparisons inside training/validation.
+    """
+    # Convert to tensor on the right device/dtype
+    if isinstance(threshold, torch.Tensor):
+        threshold_tensor = threshold.to(device=device, dtype=torch.float32)
+    else:
+        threshold_tensor = torch.as_tensor(threshold, dtype=torch.float32, device=device)
+
+    # If double thresholds are passed, use the "on" thresholds for Task A logic
+    if threshold_tensor.ndim > 1 and threshold_tensor.shape[0] == 2:
+        threshold_tensor = threshold_tensor[0]
+
+    # Flatten and broadcast to the number of classes
+    threshold_tensor = threshold_tensor.flatten()
     if threshold_tensor.numel() == 1:
         threshold_tensor = threshold_tensor.expand(num_classes)
+    elif threshold_tensor.numel() != num_classes:
+        # Safeguard: truncate or pad (with the last value) to expected size
+        if threshold_tensor.numel() > num_classes:
+            threshold_tensor = threshold_tensor[:num_classes]
+        else:
+            pad_value = threshold_tensor[-1].item()
+            pad_len = num_classes - threshold_tensor.numel()
+            threshold_tensor = torch.cat([
+                threshold_tensor,
+                torch.full((pad_len,), pad_value, device=device, dtype=threshold_tensor.dtype)
+            ])
+
     return threshold_tensor
 
 
@@ -90,8 +115,8 @@ def train_epoch(model, loader, criterion, optimizer, device, config):
         # Compute F1 score
         evaluation_cfg = config.get('evaluation', {})
         raw_threshold = evaluation_cfg.get('task_a_thresholds', 0.5)
-        threshold = _prepare_threshold(raw_threshold, outputs['logits'].shape[-1], device)
-        predictions = (torch.sigmoid(outputs['logits']) > threshold).float()
+        threshold_tensor = _prepare_threshold(raw_threshold, outputs['logits'].shape[-1], device)
+        predictions = (torch.sigmoid(outputs['logits']) > threshold_tensor).float()
 
         batch_f1 = _macro_f1(predictions, labels)
         epoch_metrics['f1'] += batch_f1.item() / num_batches

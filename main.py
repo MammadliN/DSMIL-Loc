@@ -22,6 +22,8 @@ from utils.config_loader import get_default_config
 
 # Path to the root directory of AnuraSet
 ANURASET_ROOT = Path(r"C:\\Users\\noma01\\PycharmProjects\\WSSED\\PAM datasets\\AnuraSet\\audio")
+# Fraction of training set to carve out as validation (0.0 disables validation)
+VALIDATION_FRACTION = 0.0
 
 
 @dataclass
@@ -354,7 +356,7 @@ def _collect_outputs(model: ImprovedLocalizationMILNet, loader: DataLoader, devi
 def _create_validation_split(
     metadata: pd.DataFrame,
     class_columns: List[str],
-    val_fraction: float = 0.15,
+    val_fraction: float,
     seed: int = 42,
 ) -> pd.DataFrame:
     """Split training recordings into train/validation by 60s source clip.
@@ -364,6 +366,9 @@ def _create_validation_split(
     that all 3-second windows from the same clip stay together. We also try to
     ensure every class has at least one positive recording in validation.
     """
+
+    if val_fraction <= 0:
+        return metadata.copy()
 
     rng = np.random.default_rng(seed)
 
@@ -425,6 +430,7 @@ def prepare_datasets(
     root_dir: Path,
     fraction: float = 1.0,
     seed: int = 42,
+    val_fraction: float = VALIDATION_FRACTION,
 ) -> Tuple[AnuraSetBagDataset, AnuraSetBagDataset, AnuraSetBagDataset, List[str]]:
     metadata_path = root_dir / "metadata.csv"
     metadata = pd.read_csv(metadata_path)
@@ -433,7 +439,7 @@ def prepare_datasets(
     subset_idx = list(metadata.columns).index("subset")
     class_columns = metadata.columns[subset_idx + 1 :].tolist()
 
-    metadata = _create_validation_split(metadata, class_columns, val_fraction=0.15, seed=seed)
+    metadata = _create_validation_split(metadata, class_columns, val_fraction=val_fraction, seed=seed)
 
     train_meta = _sample_subset(metadata, "train", fraction, seed)
     val_meta = _sample_subset(metadata, "validation", fraction, seed)
@@ -450,14 +456,20 @@ def run_pipeline(
     root_dir: Path = ANURASET_ROOT,
     fraction: float = 1.0,
     seed: int = 42,
+    val_fraction: float = VALIDATION_FRACTION,
+    early_stopping: bool = False,
+    early_stopping_patience: int = 3,
 ):
     config = get_default_config()
     config["paths"]["results_dir"] = str(Path("results") / "anuraset")
-    config["training"]["num_epochs"] = 5
+    config["training"]["num_epochs"] = 1000
     config["training"]["batch_size"] = 2
     config["training"]["device"] = "cuda" if torch.cuda.is_available() else "cpu"
+    config["training"]["patience"] = early_stopping_patience
 
-    train_ds, val_ds, test_ds, class_columns = prepare_datasets(root_dir, fraction=fraction, seed=seed)
+    train_ds, val_ds, test_ds, class_columns = prepare_datasets(
+        root_dir, fraction=fraction, seed=seed, val_fraction=val_fraction
+    )
     num_classes = len(class_columns)
 
     config["model"]["num_classes"] = num_classes
@@ -471,12 +483,14 @@ def run_pipeline(
         shuffle=True,
         collate_fn=collate_whale_bags,
     )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=config["training"]["batch_size"],
-        shuffle=False,
-        collate_fn=collate_whale_bags,
-    )
+    val_loader = None
+    if len(val_ds) > 0:
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=config["training"]["batch_size"],
+            shuffle=False,
+            collate_fn=collate_whale_bags,
+        )
     test_loader = DataLoader(
         test_ds,
         batch_size=config["training"]["batch_size"],
@@ -511,6 +525,7 @@ def run_pipeline(
         device=device,
         config=config,
         output_dir=results_dir,
+        early_stopping_enabled=early_stopping,
     )
 
     # Rebuild criterion for evaluation to avoid using potentially moved tensor
@@ -520,21 +535,25 @@ def run_pipeline(
         focal_gamma=config["training"]["focal_gamma"],
     )
 
-    # Validation evaluation for threshold tuning
-    val_eval_loader = DataLoader(
-        val_ds,
+    # Threshold tuning on test set (acts as validation for weakly supervised setup)
+    tuning_eval_loader = DataLoader(
+        test_ds,
         batch_size=config["training"]["batch_size"],
         shuffle=False,
         collate_fn=collate_localization_bags,
     )
 
-    val_bag_probs, val_bag_labels, val_inst_probs, val_inst_labels, val_inst_counts = _collect_outputs(
-        model, val_eval_loader, device
-    )
+    (
+        tune_bag_probs,
+        tune_bag_labels,
+        tune_inst_probs,
+        tune_inst_labels,
+        tune_inst_counts,
+    ) = _collect_outputs(model, tuning_eval_loader, device)
 
-    task_a_thresholds = _optimize_task_a_thresholds(val_bag_probs, val_bag_labels)
-    task_b_single_thresholds = _optimize_task_b_single(val_inst_probs, val_inst_labels)
-    task_b_double_thresholds = _optimize_task_b_double(val_inst_probs, val_inst_labels, val_inst_counts)
+    task_a_thresholds = _optimize_task_a_thresholds(tune_bag_probs, tune_bag_labels)
+    task_b_single_thresholds = _optimize_task_b_single(tune_inst_probs, tune_inst_labels)
+    task_b_double_thresholds = _optimize_task_b_double(tune_inst_probs, tune_inst_labels, tune_inst_counts)
 
     with open(results_dir / "thresholds.json", "w") as f:
         json.dump(
@@ -546,16 +565,6 @@ def run_pipeline(
             f,
             indent=2,
         )
-
-    # Evaluate on validation with tuned thresholds
-    val_metrics = evaluate(
-        model,
-        val_loader,
-        eval_criterion,
-        device,
-        threshold=torch.tensor(task_a_thresholds).to(device),
-    )
-    print_metrics(val_metrics)
 
     # Test evaluation using tuned Task A thresholds
     test_metrics = evaluate(
@@ -627,6 +636,23 @@ if __name__ == "__main__":
         help="Single fraction of each split to use (0-1], e.g., 0.1 for 10% quick run",
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed for fractional sampling")
+    parser.add_argument(
+        "--val-fraction",
+        type=float,
+        default=VALIDATION_FRACTION,
+        help="Fraction of training recordings to hold out as validation (0 disables validation)",
+    )
+    parser.add_argument(
+        "--early-stopping",
+        action="store_true",
+        help="Enable trend-based early stopping (disabled by default)",
+    )
+    parser.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=3,
+        help="Patience for early stopping when enabled",
+    )
 
     args = parser.parse_args()
 
@@ -634,4 +660,7 @@ if __name__ == "__main__":
         root_dir=args.root,
         fraction=args.fraction,
         seed=args.seed,
+        val_fraction=args.val_fraction,
+        early_stopping=args.early_stopping,
+        early_stopping_patience=args.early_stopping_patience,
     )

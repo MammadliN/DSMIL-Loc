@@ -230,18 +230,28 @@ def evaluate(model, loader, criterion, device, threshold=0.5):
     
     return metrics
 
-def train_model(model, train_loader, val_loader, device, config, output_dir):
-    """Train model with early stopping and save checkpoints"""
+def train_model(
+    model,
+    train_loader,
+    val_loader,
+    device,
+    config,
+    output_dir,
+    early_stopping_enabled: bool = True,
+):
+    """Train model with optional early stopping and save checkpoints"""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
     # Initialize early stopping
-    early_stopping = TrendBasedEarlyStopping(
-        patience=config['training']['patience'],
-        window_size=10,
-        min_epochs=config['training']['warmup_epochs'],
-        min_improvement=0.01
-    )
+    early_stopping = None
+    if early_stopping_enabled and val_loader is not None and len(val_loader) > 0:
+        early_stopping = TrendBasedEarlyStopping(
+            patience=config['training']['patience'],
+            window_size=10,
+            min_epochs=config['training']['warmup_epochs'],
+            min_improvement=0.01
+        )
     
     # Initialize optimizer
     optimizer = torch.optim.AdamW(
@@ -282,6 +292,7 @@ def train_model(model, train_loader, val_loader, device, config, output_dir):
     # Define checkpoint path
     checkpoint_path = output_dir / 'best_model.pt'
     best_model_state = None
+    best_metric = -float('inf')
     
     logger.info("Starting training...")
     for epoch in range(config['training']['num_epochs']):
@@ -291,42 +302,54 @@ def train_model(model, train_loader, val_loader, device, config, output_dir):
         # Validation phase
         evaluation_cfg = config.get('evaluation', {})
         val_threshold = evaluation_cfg.get('task_a_thresholds', 0.5)
-        val_metrics = evaluate(model, val_loader, criterion, device, threshold=val_threshold)
+        if val_loader is not None and len(val_loader) > 0:
+            val_metrics = evaluate(model, val_loader, criterion, device, threshold=val_threshold)
+        else:
+            val_metrics = None
         
         # Update learning rate
-        scheduler.step(val_metrics['f1'])
+        metric_for_scheduler = val_metrics['f1'] if val_metrics is not None else train_metrics['f1']
+        scheduler.step(metric_for_scheduler)
         
         # Store history
         history['train_f1'].append(train_metrics['f1'])
-        history['val_f1'].append(val_metrics['f1'])
+        history['val_f1'].append(val_metrics['f1'] if val_metrics is not None else train_metrics['f1'])
         history['train_loss'].append(train_metrics['loss'])
-        history['val_loss'].append(val_metrics['loss'])
+        history['val_loss'].append(val_metrics['loss'] if val_metrics is not None else train_metrics['loss'])
         history['learning_rates'].append(optimizer.param_groups[0]['lr'])
         
         # Print epoch summary
         logger.info(f"\nEpoch {epoch+1}:")
         logger.info(f"Train Loss: {train_metrics['loss']:.4f}, F1: {train_metrics['f1']:.4f}")
-        logger.info(f"Val Loss: {val_metrics['loss']:.4f}, F1: {val_metrics['f1']:.4f}")
+        if val_metrics is not None:
+            logger.info(f"Val Loss: {val_metrics['loss']:.4f}, F1: {val_metrics['f1']:.4f}")
+        else:
+            logger.info("Validation skipped (no validation loader)")
         
         # Check early stopping with trend analysis
-        should_stop, trend_info = early_stopping(val_metrics['f1'], epoch)
+        trend_info = {'status': 'disabled'}
+        should_stop = False
+        metric_for_selection = val_metrics['f1'] if val_metrics is not None else train_metrics['f1']
+        if early_stopping is not None:
+            should_stop, trend_info = early_stopping(metric_for_selection, epoch)
         history['trends'].append(trend_info)
         
         # Save best model
-        if val_metrics['f1'] > early_stopping.best_f1:
-            logger.info(f"New best model! F1: {val_metrics['f1']:.4f}")
+        if metric_for_selection > best_metric:
+            best_metric = metric_for_selection
+            logger.info(f"New best model! F1: {metric_for_selection:.4f}")
             best_model_state = {
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
-                'val_metrics': val_metrics,
+                'val_metrics': val_metrics if val_metrics is not None else train_metrics,
                 'config': config
             }
             torch.save(best_model_state, checkpoint_path)
-            
+
             # Print detailed metrics for best model
-            print_metrics(val_metrics)
+            print_metrics(val_metrics if val_metrics is not None else train_metrics)
         
         # Check for early stopping
         if should_stop:

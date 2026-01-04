@@ -66,7 +66,7 @@ def collate_localization_bags(batch):
                     instance_labels[i] = item['instance_labels'][i]
                     ground_truth_calls.append({
                         'start_time': item['instance_timestamps'][i],
-                        'duration': 15.0  # Instance duration
+                        'duration': 3.0  # Instance duration
                     })
             
             processed_batch.append({

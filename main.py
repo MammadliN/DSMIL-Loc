@@ -100,6 +100,7 @@ class AnuraSetBagDataset(Dataset):
 
                 spec_features = self.creator.extract_spectrogram_features(audio)
                 spec = self._pad_spectrogram(spec_features["spectrogram"])
+                spec = np.nan_to_num(spec, nan=0.0, posinf=0.0, neginf=0.0)
 
                 freqs = librosa.fft_frequencies(sr=self.creator.target_sr, n_fft=self.creator.nfft)
                 temporal_features = self.creator.extract_temporal_features(audio)
@@ -111,6 +112,7 @@ class AnuraSetBagDataset(Dataset):
                     *(temporal_features.get(k, 0.0) for k in self.temporal_feature_keys),
                     *(physics_features.get(k, 0.0) for k in self.physics_feature_keys),
                 ]
+                feature_vector = np.nan_to_num(feature_vector, nan=0.0, posinf=0.0, neginf=0.0)
 
                 label_vector = row[self.class_columns].astype(float).to_numpy(dtype=np.float32)
 
@@ -323,8 +325,14 @@ def _collect_outputs(model: ImprovedLocalizationMILNet, loader: DataLoader, devi
             raw_scores = outputs["raw_scores"]
             valid_mask = torch.arange(raw_scores.size(1), device=device).unsqueeze(0) < num_instances.unsqueeze(1)
             safe_scores = torch.where(valid_mask.unsqueeze(-1), raw_scores, torch.zeros_like(raw_scores))
-            instance_probs.append(torch.sigmoid(safe_scores).cpu().numpy())
-            instance_labels.append(batch["instance_labels"].cpu().numpy())
+            batch_probs = torch.sigmoid(safe_scores).cpu().numpy()
+            batch_labels = batch["instance_labels"].cpu().numpy()
+
+            # collect per-bag sequences to allow variable instance counts across batches
+            for i in range(batch_probs.shape[0]):
+                inst_count = int(num_instances[i].item())
+                instance_probs.append(batch_probs[i, :inst_count])
+                instance_labels.append(batch_labels[i, :inst_count])
 
     return (
         np.concatenate(bag_probs),

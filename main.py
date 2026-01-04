@@ -274,24 +274,30 @@ def _double_threshold_predictions(probs: np.ndarray, on_thr: float, off_thr: flo
     return np.array(preds, dtype=np.float32)
 
 
-def _optimize_task_b_double(instance_probs: np.ndarray, instance_labels: np.ndarray) -> Dict[str, Tuple[float, float]]:
+def _optimize_task_b_double(
+    instance_probs: np.ndarray, instance_labels: np.ndarray, instance_counts: List[int]
+) -> Dict[str, Tuple[float, float]]:
     num_classes = instance_labels.shape[-1]
     best_thresholds: Dict[str, Tuple[float, float]] = {}
 
     flat_labels = instance_labels.reshape(-1, num_classes)
-    flat_probs = instance_probs.reshape(-1, instance_probs.shape[-1])
+
+    # build per-bag slices from flat probs
+    sequences = []
+    start = 0
+    for count in instance_counts:
+        end = start + count
+        sequences.append(instance_probs[start:end])
+        start = end
 
     for c in range(num_classes):
         best_f1 = -1.0
         best_on, best_off = 0.5, 0.2
         for on_thr in np.linspace(0.2, 0.8, 13):
             for off_thr in np.linspace(0.05, on_thr - 0.05, max(1, int((on_thr - 0.05) / 0.05))):
-                preds = (flat_probs[:, c] > on_thr).astype(float)
-                # apply hysteresis per bag to respect sequences
                 preds_sequence = []
-                start = 0
-                for probs_seq in instance_probs[:, :, c]:
-                    preds_sequence.append(_double_threshold_predictions(probs_seq, on_thr, off_thr))
+                for probs_seq in sequences:
+                    preds_sequence.append(_double_threshold_predictions(probs_seq[:, c], on_thr, off_thr))
                 preds_sequence = np.concatenate(preds_sequence)
                 f1 = _macro_f1_np(preds_sequence.reshape(-1, 1), flat_labels[:, c : c + 1])
                 if f1 > best_f1:
@@ -305,6 +311,7 @@ def _optimize_task_b_double(instance_probs: np.ndarray, instance_labels: np.ndar
 def _collect_outputs(model: ImprovedLocalizationMILNet, loader: DataLoader, device: torch.device):
     bag_probs, bag_labels = [], []
     instance_probs, instance_labels = [], []
+    instance_counts: List[int] = []
 
     model.eval()
     with torch.no_grad():
@@ -331,6 +338,7 @@ def _collect_outputs(model: ImprovedLocalizationMILNet, loader: DataLoader, devi
             # collect per-bag sequences to allow variable instance counts across batches
             for i in range(batch_probs.shape[0]):
                 inst_count = int(num_instances[i].item())
+                instance_counts.append(inst_count)
                 instance_probs.append(batch_probs[i, :inst_count])
                 instance_labels.append(batch_labels[i, :inst_count])
 
@@ -339,6 +347,7 @@ def _collect_outputs(model: ImprovedLocalizationMILNet, loader: DataLoader, devi
         np.concatenate(bag_labels),
         np.concatenate(instance_probs),
         np.concatenate(instance_labels),
+        instance_counts,
     )
 
 
@@ -519,13 +528,13 @@ def run_pipeline(
         collate_fn=collate_localization_bags,
     )
 
-    val_bag_probs, val_bag_labels, val_inst_probs, val_inst_labels = _collect_outputs(
+    val_bag_probs, val_bag_labels, val_inst_probs, val_inst_labels, val_inst_counts = _collect_outputs(
         model, val_eval_loader, device
     )
 
     task_a_thresholds = _optimize_task_a_thresholds(val_bag_probs, val_bag_labels)
     task_b_single_thresholds = _optimize_task_b_single(val_inst_probs, val_inst_labels)
-    task_b_double_thresholds = _optimize_task_b_double(val_inst_probs, val_inst_labels)
+    task_b_double_thresholds = _optimize_task_b_double(val_inst_probs, val_inst_labels, val_inst_counts)
 
     with open(results_dir / "thresholds.json", "w") as f:
         json.dump(
@@ -565,9 +574,13 @@ def run_pipeline(
         shuffle=False,
         collate_fn=collate_localization_bags,
     )
-    test_bag_probs, test_bag_labels, test_inst_probs, test_inst_labels = _collect_outputs(
-        model, test_eval_loader, device
-    )
+    (
+        test_bag_probs,
+        test_bag_labels,
+        test_inst_probs,
+        test_inst_labels,
+        test_inst_counts,
+    ) = _collect_outputs(model, test_eval_loader, device)
 
     task_b_single_preds = (test_inst_probs > task_b_single_thresholds).astype(float)
     task_b_single_f1 = _macro_f1_np(
@@ -576,11 +589,19 @@ def run_pipeline(
     )
 
     task_b_double_preds = []
+    # rebuild per-bag sequences for hysteresis decoding
+    seqs = []
+    start = 0
+    for count in test_inst_counts:
+        end = start + count
+        seqs.append(test_inst_probs[start:end])
+        start = end
+
     for c in range(test_inst_probs.shape[-1]):
         on_thr, off_thr = task_b_double_thresholds[str(c)]
         class_preds = []
-        for seq in test_inst_probs[:, :, c]:
-            class_preds.append(_double_threshold_predictions(seq, on_thr, off_thr))
+        for seq in seqs:
+            class_preds.append(_double_threshold_predictions(seq[:, c], on_thr, off_thr))
         task_b_double_preds.append(np.stack(class_preds))
     task_b_double_preds = np.stack(task_b_double_preds, axis=-1)
     task_b_double_f1 = _macro_f1_np(

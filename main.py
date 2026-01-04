@@ -589,20 +589,17 @@ def run_pipeline(
     )
 
     task_b_double_preds = []
-    # rebuild per-bag sequences for hysteresis decoding
-    seqs = []
-    start = 0
-    for count in test_inst_counts:
-        end = start + count
-        seqs.append(test_inst_probs[start:end])
-        start = end
-
+    # rebuild per-bag sequences for hysteresis decoding while keeping flat ordering
     for c in range(test_inst_probs.shape[-1]):
         on_thr, off_thr = task_b_double_thresholds[str(c)]
         class_preds = []
-        for seq in seqs:
-            class_preds.append(_double_threshold_predictions(seq[:, c], on_thr, off_thr))
-        task_b_double_preds.append(np.stack(class_preds))
+        start = 0
+        for count in test_inst_counts:
+            end = start + count
+            seq = test_inst_probs[start:end, c]
+            class_preds.append(_double_threshold_predictions(seq, on_thr, off_thr))
+            start = end
+        task_b_double_preds.append(np.concatenate(class_preds, axis=0))
     task_b_double_preds = np.stack(task_b_double_preds, axis=-1)
     task_b_double_f1 = _macro_f1_np(
         task_b_double_preds.reshape(-1, task_b_double_preds.shape[-1]),

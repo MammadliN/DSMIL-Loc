@@ -41,6 +41,17 @@ def _macro_f1(predictions: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     return f1_per_class.mean()
 
 
+def _prepare_threshold(threshold, num_classes: int, device: torch.device) -> torch.Tensor:
+    """Return a tensor threshold of shape (num_classes,) on the target device."""
+    if isinstance(threshold, (float, int)):
+        return torch.full((num_classes,), float(threshold), device=device)
+
+    threshold_tensor = torch.as_tensor(threshold, dtype=torch.float32, device=device)
+    if threshold_tensor.numel() == 1:
+        threshold_tensor = threshold_tensor.expand(num_classes)
+    return threshold_tensor
+
+
 def train_epoch(model, loader, criterion, optimizer, device, config):
     """Run single training epoch with stability improvements"""
     epoch_metrics = {'loss': 0.0, 'f1': 0.0}
@@ -78,7 +89,8 @@ def train_epoch(model, loader, criterion, optimizer, device, config):
         
         # Compute F1 score
         evaluation_cfg = config.get('evaluation', {})
-        threshold = evaluation_cfg.get('task_a_thresholds', 0.5)
+        raw_threshold = evaluation_cfg.get('task_a_thresholds', 0.5)
+        threshold = _prepare_threshold(raw_threshold, outputs['logits'].shape[-1], device)
         predictions = (torch.sigmoid(outputs['logits']) > threshold).float()
 
         batch_f1 = _macro_f1(predictions, labels)
@@ -97,6 +109,8 @@ def evaluate(model, loader, criterion, device, threshold=0.5):
     predictions = []
     labels = []
     
+    threshold_tensor = None
+
     with torch.no_grad():
         for batch in tqdm(loader, desc="Evaluating"):
             if batch is None:
@@ -115,8 +129,14 @@ def evaluate(model, loader, criterion, device, threshold=0.5):
             # Store loss
             total_loss += loss.item()
             
+            # Lazily prepare threshold to match current batch/device
+            if threshold_tensor is None:
+                threshold_tensor = _prepare_threshold(
+                    threshold, outputs['logits'].shape[-1], device
+                )
+
             # Get predictions
-            batch_preds = (torch.sigmoid(outputs['logits']) > threshold).float()
+            batch_preds = (torch.sigmoid(outputs['logits']) > threshold_tensor).float()
             
             # Store predictions and labels
             predictions.extend(batch_preds.cpu().numpy())

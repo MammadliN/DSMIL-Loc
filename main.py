@@ -334,7 +334,20 @@ def _collect_outputs(model: ImprovedLocalizationMILNet, loader: DataLoader, devi
     )
 
 
-def prepare_datasets(root_dir: Path) -> Tuple[AnuraSetBagDataset, AnuraSetBagDataset, AnuraSetBagDataset, List[str]]:
+def _sample_subset(meta: pd.DataFrame, subset: str, fraction: float, seed: int) -> pd.DataFrame:
+    if not (0 < fraction <= 1):
+        raise ValueError(f"Fraction for {subset} must be in (0, 1], got {fraction}")
+    subset_df = meta[meta["subset"] == subset].copy()
+    if fraction < 1:
+        subset_df = subset_df.sample(frac=fraction, random_state=seed).reset_index(drop=True)
+    return subset_df
+
+
+def prepare_datasets(
+    root_dir: Path,
+    fraction: float = 1.0,
+    seed: int = 42,
+) -> Tuple[AnuraSetBagDataset, AnuraSetBagDataset, AnuraSetBagDataset, List[str]]:
     metadata_path = root_dir / "metadata.csv"
     metadata = pd.read_csv(metadata_path)
 
@@ -342,21 +355,29 @@ def prepare_datasets(root_dir: Path) -> Tuple[AnuraSetBagDataset, AnuraSetBagDat
     subset_idx = list(metadata.columns).index("subset")
     class_columns = metadata.columns[subset_idx + 1 :].tolist()
 
-    train_ds = AnuraSetBagDataset(root_dir, metadata, subset="train", class_columns=class_columns)
-    val_ds = AnuraSetBagDataset(root_dir, metadata, subset="validation", class_columns=class_columns)
-    test_ds = AnuraSetBagDataset(root_dir, metadata, subset="test", class_columns=class_columns)
+    train_meta = _sample_subset(metadata, "train", fraction, seed)
+    val_meta = _sample_subset(metadata, "validation", fraction, seed)
+    test_meta = _sample_subset(metadata, "test", fraction, seed)
+
+    train_ds = AnuraSetBagDataset(root_dir, train_meta, subset="train", class_columns=class_columns)
+    val_ds = AnuraSetBagDataset(root_dir, val_meta, subset="validation", class_columns=class_columns)
+    test_ds = AnuraSetBagDataset(root_dir, test_meta, subset="test", class_columns=class_columns)
 
     return train_ds, val_ds, test_ds, class_columns
 
 
-def run_pipeline():
+def run_pipeline(
+    root_dir: Path = ANURASET_ROOT,
+    fraction: float = 1.0,
+    seed: int = 42,
+):
     config = get_default_config()
     config["paths"]["results_dir"] = str(Path("results") / "anuraset")
     config["training"]["num_epochs"] = 5
     config["training"]["batch_size"] = 2
     config["training"]["device"] = "cuda" if torch.cuda.is_available() else "cpu"
 
-    train_ds, val_ds, test_ds, class_columns = prepare_datasets(ANURASET_ROOT)
+    train_ds, val_ds, test_ds, class_columns = prepare_datasets(root_dir, fraction=fraction, seed=seed)
     num_classes = len(class_columns)
 
     config["model"]["num_classes"] = num_classes
@@ -508,4 +529,20 @@ def run_pipeline():
 
 
 if __name__ == "__main__":
-    run_pipeline()
+    parser = argparse.ArgumentParser(description="Run AnuraSet MIL pipeline")
+    parser.add_argument("--root", type=Path, default=ANURASET_ROOT, help="Path to AnuraSet root directory")
+    parser.add_argument(
+        "--fraction",
+        type=float,
+        default=1.0,
+        help="Single fraction of each split to use (0-1], e.g., 0.1 for 10% quick run",
+    )
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for fractional sampling")
+
+    args = parser.parse_args()
+
+    run_pipeline(
+        root_dir=args.root,
+        fraction=args.fraction,
+        seed=args.seed,
+    )

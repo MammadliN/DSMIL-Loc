@@ -573,7 +573,7 @@ def run_pipeline(
     val_f1a_05 = _macro_f1_np((tune_bag_probs > 0.5).astype(float), tune_bag_labels)
     val_f1a_02 = _macro_f1_np((tune_bag_probs > 0.2).astype(float), tune_bag_labels)
     logger.info(
-        "Validation (Task A) fixed thresholds — F1@0.5: %.4f, F1@0.2: %.4f",
+        "Validation (Task A) fixed thresholds - F1@0.5: %.4f, F1@0.2: %.4f",
         val_f1a_05,
         val_f1a_02,
     )
@@ -587,7 +587,7 @@ def run_pipeline(
         tune_inst_labels.reshape(-1, tune_inst_labels.shape[-1]),
     )
     logger.info(
-        "Validation (Task B) fixed thresholds — F1@0.5: %.4f, F1@0.2: %.4f",
+        "Validation (Task B) fixed thresholds - F1@0.5: %.4f, F1@0.2: %.4f",
         val_f1b_05,
         val_f1b_02,
     )
@@ -641,7 +641,7 @@ def run_pipeline(
         test_inst_labels.reshape(-1, test_inst_labels.shape[-1]),
     )
     logger.info(
-        "Test (Task B) fixed thresholds — F1@0.5: %.4f, F1@0.2: %.4f",
+        "Test (Task B) fixed thresholds - F1@0.5: %.4f, F1@0.2: %.4f",
         test_f1b_05,
         test_f1b_02,
     )

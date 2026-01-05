@@ -214,14 +214,25 @@ def get_default_config() -> Dict[str, Any]:
             'max_grad_norm': 1.0,
             'label_smoothing': 0.1,
             'focal_gamma': 2.0,
-            'warmup_epochs': 5
+            'warmup_epochs': 5,
+            'pos_weight': None
         },
         'model': {
             'feature_dim': 512,
-            'num_heads': 4
+            'num_heads': 4,
+            'num_classes': 1
         },
         'logging': {
             'log_every': 10
+        },
+        'evaluation': {
+            'task_a_thresholds': 0.5,
+            'task_b_strategy': 'single',
+            'task_b_thresholds': 0.2,
+            'task_b_double_thresholds': {
+                'on': 0.3,
+                'off': 0.1
+            }
         },
         'wandb': {
             'enabled': False,
